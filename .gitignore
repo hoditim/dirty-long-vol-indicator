@@ -1,0 +1,21 @@
+# Sensitive configuration
+.env
+
+# Runtime state and logs
+state.json
+indicator.log
+cron.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
