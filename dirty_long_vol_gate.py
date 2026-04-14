@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
 Dirty Long Vol Indicator
-Monitors VIX spike conditions and sends SMS alerts via AT&T email-to-SMS gateway.
+Monitors VIX spike conditions and sends SMS alerts via Textbelt.
 """
 
 import argparse
 import json
 import logging
 import os
-import smtplib
 import socket
 import sys
 import time
 from datetime import datetime, timedelta
-from email.mime.text import MIMEText
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from dotenv import load_dotenv
 
@@ -107,44 +106,66 @@ class State:
 
 
 class SMSAlert:
-    """Handles SMS sending via AT&T email-to-SMS gateway."""
+    """Handles SMS sending via Textbelt API."""
 
     def __init__(self):
         load_dotenv(SCRIPT_DIR / ".env")
-        self.smtp_server = os.getenv("SMTP_SERVER")
-        self.smtp_port = int(os.getenv("SMTP_PORT", 587))
-        self.smtp_user = os.getenv("SMTP_USER")
-        self.smtp_pass = os.getenv("SMTP_PASS")
-        self.sms_to = os.getenv("SMS_TO")
+        self.api_key = os.getenv("TEXTBELT_API_KEY")
+        self.phone = os.getenv("SMS_PHONE")
 
-        if not all([self.smtp_server, self.smtp_user, self.smtp_pass, self.sms_to]):
-            raise ValueError("Missing SMTP configuration in .env file")
+        if not all([self.api_key, self.phone]):
+            raise ValueError("Missing Textbelt configuration in .env file")
 
-    def send(self, message, retry=True):
-        """Send SMS alert via email-to-SMS gateway."""
-        logger.info(f"Attempting to send SMS to {self.sms_to}")
+    def send(self, message, is_test_mode=False, retry=True):
+        """Send SMS alert via Textbelt API.
+
+        Args:
+            message: SMS message text
+            is_test_mode: If True, append _test to API key (no quota consumption)
+            retry: If True, retry once on failure
+        """
+        # Use _test suffix for test modes to avoid consuming quota
+        api_key = self.api_key + '_test' if is_test_mode else self.api_key
+
+        logger.info(f"Attempting to send SMS to {self.phone} (test_mode={is_test_mode})")
         logger.info(f"Message preview: {message[:100]}...")
 
-        msg = MIMEText(message)
-        msg['Subject'] = "DLV Alert"
-        msg['From'] = self.smtp_user
-        msg['To'] = self.sms_to
-
         try:
-            with smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=30) as server:
-                server.set_debuglevel(0)
-                server.starttls()
-                server.login(self.smtp_user, self.smtp_pass)
-                server.send_message(msg)
-                logger.info("SMS sent successfully")
+            response = requests.post('https://textbelt.com/text',
+                data={
+                    'phone': self.phone,
+                    'message': message,
+                    'key': api_key
+                },
+                timeout=30
+            )
+
+            result = response.json()
+
+            if result.get('success'):
+                logger.info(f"SMS sent successfully via Textbelt")
+                logger.info(f"  Text ID: {result.get('textId', 'N/A')}")
+                logger.info(f"  Quota remaining: {result.get('quotaRemaining', 'N/A')}")
                 return True
+            else:
+                error = result.get('error', 'Unknown error')
+                logger.error(f"Textbelt API error: {error}")
+                logger.error(f"  Quota remaining: {result.get('quotaRemaining', 'N/A')}")
+
+                if retry and 'quota' not in error.lower():
+                    logger.info("Retrying in 30 seconds...")
+                    time.sleep(30)
+                    return self.send(message, is_test_mode=is_test_mode, retry=False)
+
+                return False
+
         except Exception as e:
             logger.error(f"Failed to send SMS: {e}")
 
             if retry:
                 logger.info("Retrying in 30 seconds...")
                 time.sleep(30)
-                return self.send(message, retry=False)
+                return self.send(message, is_test_mode=is_test_mode, retry=False)
 
             logger.error("Final SMS send attempt failed")
             return False
@@ -177,13 +198,18 @@ class VolatilityIndicator:
             if isinstance(self.spy_data.columns, pd.MultiIndex):
                 self.spy_data.columns = self.spy_data.columns.get_level_values(0)
 
-            # Get the most recent date
-            vix_last_date = self.vix_data.index[-1].date()
-            spy_last_date = self.spy_data.index[-1].date()
+            # Get the most recent date and timestamp
+            vix_last_timestamp = self.vix_data.index[-1]
+            spy_last_timestamp = self.spy_data.index[-1]
+            vix_last_date = vix_last_timestamp.date()
+            spy_last_date = spy_last_timestamp.date()
             self.last_data_date = min(vix_last_date, spy_last_date)
 
-            logger.info(f"Fetched {len(self.vix_data)} VIX data points, last date: {vix_last_date}")
-            logger.info(f"Fetched {len(self.spy_data)} SPY data points, last date: {spy_last_date}")
+            logger.info(f"Fetched {len(self.vix_data)} VIX data points")
+            logger.info(f"  VIX last timestamp: {vix_last_timestamp} (date: {vix_last_date})")
+            logger.info(f"Fetched {len(self.spy_data)} SPY data points")
+            logger.info(f"  SPY last timestamp: {spy_last_timestamp} (date: {spy_last_date})")
+            logger.info(f"  Using data as of: {self.last_data_date}")
 
             return True
 
@@ -381,16 +407,16 @@ def main():
     # Handle different modes
     if args.test:
         # TEST MODE
-        logger.info("TEST MODE: Sending test SMS")
+        logger.info("TEST MODE: Sending test SMS (using _test suffix, no quota consumption)")
         message = create_test_message()
-        sms.send(message)
+        sms.send(message, is_test_mode=True)
         return
 
     elif args.startup:
         # STARTUP MODE
-        logger.info("STARTUP MODE: Sending startup confirmation")
+        logger.info("STARTUP MODE: Sending startup confirmation (using _test suffix)")
         message = create_startup_message()
-        sms.send(message)
+        sms.send(message, is_test_mode=True)
         return
 
     elif args.heartbeat:
@@ -416,7 +442,7 @@ def main():
             state.record_failure()
             message = create_heartbeat_message(None)
 
-        if sms.send(message):
+        if sms.send(message, is_test_mode=False):
             state.record_heartbeat(today)
         return
 
@@ -433,7 +459,7 @@ def main():
             if failures >= 3:
                 logger.error(f"Data fetch has failed {failures} consecutive times")
                 error_msg = f"DLV ERROR: data fetch has failed {failures} consecutive days. Check yfinance / network."
-                sms.send(error_msg)
+                sms.send(error_msg, is_test_mode=False)
 
             return
 
@@ -444,7 +470,7 @@ def main():
         valid, error_msg = indicator.validate_data()
         if not valid:
             if error_msg:
-                sms.send(error_msg)
+                sms.send(error_msg, is_test_mode=False)
             return
 
         # Calculate signal
@@ -457,7 +483,7 @@ def main():
                 logger.info("SIGNAL FIRED! Sending SMS alert")
                 message = create_signal_message(signal_data)
 
-                if sms.send(message):
+                if sms.send(message, is_test_mode=False):
                     state.record_signal(today)
                     logger.info("Signal alert sent successfully")
                 else:
